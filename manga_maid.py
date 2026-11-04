@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-MangaMaid (Portable) - All-in-One Portable Manga Downloader & CBZ Packager
-Version: Beta v0.4.0
+MangaMaid (Portable) - All-in-One Portable Manga, Doujin & Hentai Downloader & CBZ Packager
+Version: Beta v0.5.0
 Window Size: 1280x720 (16:9 Widescreen Split-Column Layout)
 """
 
+import base64
+import concurrent.futures
 import ctypes
+import html
+import json
 import logging
 import os
 import re
@@ -14,6 +18,7 @@ import threading
 import time
 import urllib.parse
 import winsound
+import zipfile
 import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageTk
@@ -26,7 +31,12 @@ from gallery_dl.extractor.utils import mangafire_vrf
 from gallery_dl.postprocessor import zip as pp_zip
 
 
-APP_VERSION = "Beta v0.4.0"
+APP_VERSION = "Beta v0.5.0"
+
+UA_STRING = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def resource_path(relative_path: str) -> str:
@@ -45,6 +55,16 @@ def get_user_downloads_folder() -> str:
     except Exception:
         pass
     return os.path.normpath(os.getcwd())
+
+
+def sanitize_filename(name: str, max_len: int = 120) -> str:
+    """Cleans a manga/doujin title for safe Windows folder and .cbz naming."""
+    clean = html.unescape(name or "").strip()
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" ._")
+    if len(clean) > max_len:
+        clean = clean[:max_len].strip(" ._")
+    return clean or "MangaMaid_Download"
 
 
 class SoundManager:
@@ -163,7 +183,7 @@ class MangaMaidDownloadJob(job.DownloadJob):
     """
     Custom DownloadJob that pre-collects all queued chapters (Message.Queue) before
     starting chapter downloads so we know the exact total chapter count for the
-    overall job progress bar (0% -> 100%).
+    overall job progress bar (0% -> 100%). Also reports single-gallery page counts.
     """
 
     def __init__(
@@ -172,11 +192,13 @@ class MangaMaidDownloadJob(job.DownloadJob):
         parent=None,
         on_total_chapters=None,
         on_chapter_start=None,
+        on_expected_pages=None,
     ):
         super().__init__(url, parent)
         self._is_root = parent is None
         self._on_total_chapters = on_total_chapters
         self._on_chapter_start = on_chapter_start
+        self._on_expected_pages = on_expected_pages
 
     def dispatch(self, messages):
         if not self._is_root:
@@ -203,6 +225,21 @@ class MangaMaidDownloadJob(job.DownloadJob):
                             queued_chapters.append((furl, follow_kwdict.copy()))
                     follow_urls = None
 
+                # Ensure "{manga}" is always populated even on single-gallery extractors
+                if not kwdict.get("manga"):
+                    fallback_title = (
+                        kwdict.get("title")
+                        or kwdict.get("title_en")
+                        or str(kwdict.get("gallery_id") or "Gallery")
+                    )
+                    kwdict["manga"] = sanitize_filename(fallback_title)
+
+                if self._on_expected_pages and kwdict.get("count"):
+                    try:
+                        self._on_expected_pages(int(kwdict["count"]))
+                    except Exception:
+                        pass
+
                 self.update_kwdict(kwdict)
                 if self.pred_post(url, kwdict):
                     process = True
@@ -223,6 +260,15 @@ class MangaMaidDownloadJob(job.DownloadJob):
                     self._on_total_chapters = None
                 if metadata_url is not None:
                     kwdict[metadata_url] = url
+                if not kwdict.get("manga"):
+                    fallback_title = (
+                        kwdict.get("title")
+                        or kwdict.get("title_en")
+                        or str(kwdict.get("gallery_id") or "Gallery")
+                    )
+                    kwdict["manga"] = sanitize_filename(fallback_title)
+                if "page" not in kwdict and "num" in kwdict:
+                    kwdict["page"] = kwdict["num"]
                 self.update_kwdict(kwdict)
                 if self.pred_url(url, kwdict):
                     self.handle_url(url, kwdict)
@@ -253,6 +299,267 @@ class MangaMaidDownloadJob(job.DownloadJob):
         return msg
 
 
+# ==============================================================================
+# UNIVERSAL DOUJIN & GALLERY EXTRACTOR ENGINE
+# Supports HentaiVox, HentaiPaw, RokuHentai, HentaiEnvy, HentaiRox, HentaiZap,
+# HentaiEra, HentaiFox, ImHentai, AsmHentai, 3Hentai, nhentai.net / .xxx / .to
+# ==============================================================================
+
+ext_map = {"j": "jpg", "p": "png", "g": "gif", "w": "webp", "a": "avif"}
+
+
+def extract_custom_gallery_pages(
+    url: str, status_cb=None
+) -> tuple[str, str, list[tuple[int, str, str]], str] | None:
+    """
+    Checks if `url` belongs to one of our custom-supported Doujin/Hentai gallery sites
+    (or uses a known reader format like readerPages / readerPagesJson / g_th).
+    Returns `(source_name, clean_title, page_list, referer_url)` where `page_list` is
+    a sorted list of `(page_number, extension_without_dot, full_image_url)`,
+    or `None` if `url` should be handled by standard `gallery-dl`.
+    """
+    if not url.startswith(("http://", "https://")):
+        return None
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    headers = {"User-Agent": UA_STRING, "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
+
+    # 1. HentaiVox (hentaivox.com/view/<id>)
+    m_hv = re.match(r"https?://(?:www\.)?hentaivox\.com/(?:view|gallery)/(\d+)", url, re.I)
+    if m_hv:
+        gid = m_hv.group(1)
+        reader_url = f"https://hentaivox.com/view/{gid}/1"
+        if status_cb:
+            status_cb(f"Connecting to HentaiVox (#{gid})...")
+        r = requests.get(reader_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        m_b64 = re.search(
+            r'var\s+readerPages\s*=\s*JSON\.parse\(atob\("([^"]+)"\)\)', r.text
+        )
+        if m_b64:
+            data = json.loads(base64.b64decode(m_b64.group(1)).decode("utf-8"))
+            raw_title = data.get("title", f"HentaiVox_{gid}")
+            clean_title = re.sub(
+                r"\s*-\s*Page\s*\{:page\}\s*-\s*HentaiVox$", "", raw_title, flags=re.I
+            ).strip()
+            base_img = data["baseUriImg"]
+            pages_dict = data["pages"]
+            pages = []
+            for p_str in sorted(pages_dict.keys(), key=int):
+                p_num = int(p_str)
+                fname = pages_dict[p_str]["f"]
+                ext = os.path.splitext(fname)[1].lstrip(".") or "jpg"
+                pages.append((p_num, ext, base_img % fname))
+            return "HentaiVox", clean_title, pages, reader_url
+
+    # 2. HentaiPaw (hentaipaw.com/articles/<id> or /viewer?articleId=<id>)
+    m_hp = re.search(
+        r"hentaipaw\.com/(?:articles/|viewer\?articleId=)(\d+)", url, re.I
+    )
+    if m_hp:
+        aid = m_hp.group(1)
+        viewer_url = f"https://hentaipaw.com/viewer?articleId={aid}&page=1"
+        if status_cb:
+            status_cb(f"Connecting to HentaiPaw (#{aid})...")
+        r = requests.get(viewer_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        m_title = re.search(r"<title>([^<]+)</title>", r.text)
+        raw_title = m_title.group(1) if m_title else f"HentaiPaw_{aid}"
+        clean_title = re.sub(
+            r"\s*(?:-\s*Page\s*\d+)?\s*(?:-\s*HentaiPaw.*)$", "", raw_title, flags=re.I
+        ).strip()
+        cdn_urls = list(
+            dict.fromkeys(
+                re.findall(
+                    rf"https://cdn\.imagedeliveries\.com/{aid}/[a-f0-9]+/(\d+)\.(webp|jpg|jpeg|png|gif)",
+                    r.text,
+                    re.I,
+                )
+            )
+        )
+        # Re-extract full URLs preserving order
+        full_matches = re.findall(
+            rf"(https://cdn\.imagedeliveries\.com/{aid}/[a-f0-9]+/(\d+)\.(webp|jpg|jpeg|png|gif))",
+            r.text,
+            re.I,
+        )
+        seen_p = set()
+        pages = []
+        for full_u, p_str, ext in full_matches:
+            p_num = int(p_str)
+            if p_num not in seen_p:
+                seen_p.add(p_num)
+                pages.append((p_num, ext.lower(), full_u))
+        pages.sort(key=lambda x: x[0])
+        if pages:
+            return "HentaiPaw", clean_title or f"HentaiPaw_{aid}", pages, viewer_url
+
+    # 3. RokuHentai (rokuhentai.com/<6char_id>)
+    m_rk = re.match(
+        r"https?://(?:www\.)?rokuhentai\.com/([a-z0-9]{5,8})(?:/\d+)?", url, re.I
+    )
+    if m_rk and m_rk.group(1).lower() not in ("search", "faq", "about", "dmca"):
+        gid = m_rk.group(1)
+        gal_url = f"https://rokuhentai.com/{gid}"
+        if status_cb:
+            status_cb(f"Connecting to RokuHentai ({gid})...")
+        r = requests.get(gal_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        m_title = re.search(r"<title>([^<]+)</title>", r.text)
+        raw_title = m_title.group(1) if m_title else f"RokuHentai_{gid}"
+        clean_title = re.sub(r"\s*-\s*Roku Hentai$", "", raw_title, flags=re.I).strip()
+        m_cnt = re.search(r"(\d+)\s+images?", r.text, re.I)
+        count = int(m_cnt.group(1)) if m_cnt else 0
+        if count == 0:
+            thumbs = re.findall(
+                rf"_images/page-thumbnails/{gid}/(\d+)\.jpg", r.text, re.I
+            )
+            if thumbs:
+                count = max(int(x) for x in thumbs) + 1
+        if count > 0:
+            pages = [
+                (i + 1, "jpg", f"https://rokuhentai.com/_images/pages/{gid}/{i}.jpg")
+                for i in range(count)
+            ]
+            return "RokuHentai", clean_title, pages, f"https://rokuhentai.com/{gid}/0"
+
+    # 4. 3Hentai (3hentai.net/d/<id>)
+    m_3h = re.match(r"https?://(?:www\.)?3hentai\.net/d/(\d+)", url, re.I)
+    if m_3h:
+        gid = m_3h.group(1)
+        gal_url = f"https://3hentai.net/d/{gid}"
+        if status_cb:
+            status_cb(f"Connecting to 3Hentai (#{gid})...")
+        r = requests.get(gal_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        m_title = re.search(r"<title>([^<]+)</title>", r.text)
+        raw_title = m_title.group(1) if m_title else f"3Hentai_{gid}"
+        clean_title = re.sub(r"\s*-\s*3Hentai$", "", raw_title, flags=re.I).strip()
+        thumbs = re.findall(
+            r"(https://s\d+\.3hentai\.xyz/d\d+/(\d+)t\.(jpg|jpeg|png|webp|gif))",
+            r.text,
+            re.I,
+        )
+        seen_p = set()
+        pages = []
+        for thumb_u, p_str, ext in thumbs:
+            p_num = int(p_str)
+            if p_num not in seen_p:
+                seen_p.add(p_num)
+                full_u = re.sub(r"(\d+)t\.([a-z]+)$", r"\1.\2", thumb_u, flags=re.I)
+                pages.append((p_num, ext.lower(), full_u))
+        pages.sort(key=lambda x: x[0])
+        if pages:
+            return "3Hentai", clean_title, pages, gal_url
+
+    # 5. AsmHentai (asmhentai.com/g/<id> or /gallery/<id>)
+    m_asm = re.match(
+        r"https?://(?:www\.)?asmhentai\.com/(?:g|gallery)/(\d+)", url, re.I
+    )
+    if m_asm:
+        gid = m_asm.group(1)
+        gal_url = f"https://asmhentai.com/g/{gid}/"
+        if status_cb:
+            status_cb(f"Connecting to AsmHentai (#{gid})...")
+        r = requests.get(gal_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        m_h1 = re.search(r"<h1>(.*?)</h1>", r.text, re.S)
+        clean_title = (
+            re.sub(r"<[^>]+>", "", m_h1.group(1)).strip()
+            if m_h1
+            else f"AsmHentai_{gid}"
+        )
+        m_cnt = re.search(r"Pages:\s*(?:</span>)?\s*(\d+)", r.text, re.I)
+        total_pages = int(m_cnt.group(1)) if m_cnt else 0
+        m_img = re.search(
+            r"(?:https?:)?//images\.asmhentai\.com/(\d+)/(\d+)/(?:cover|1t)\.(jpg|png|webp|gif)",
+            r.text,
+            re.I,
+        )
+        if m_img and total_pages > 0:
+            dir_id, img_gid, ext = m_img.group(1), m_img.group(2), m_img.group(3)
+            pages = [
+                (
+                    p,
+                    ext.lower(),
+                    f"https://images.asmhentai.com/{dir_id}/{img_gid}/{p}.{ext}",
+                )
+                for p in range(1, total_pages + 1)
+            ]
+            return "AsmHentai", clean_title, pages, gal_url
+
+    # 6. ImHentai / HentaiEnvy / HentaiRox / HentaiZap / HentaiEra / HentaiFox / nhentai.xxx / nhentai.to
+    m_im = re.match(
+        r"https?://(?:www\.)?(imhentai\.xxx|hentaienvy\.com|hentairox\.com|hentaizap\.com|hentaiera\.com|hentaifox\.com|nhentai\.xxx|nhentai\.to)/(?:gallery|view|g)/(\d+)",
+        url,
+        re.I,
+    )
+    if m_im:
+        domain, gid = m_im.group(1).lower(), m_im.group(2)
+        site_label = domain.split(".")[0].capitalize()
+        if status_cb:
+            status_cb(f"Connecting to {site_label} (#{gid})...")
+
+        # Check viewer /view/<id>/1/ or /g/<id>/1/ first for modern readerPagesJson or g_th
+        view_prefix = "g" if "nhentai" in domain else "view"
+        gal_prefix = "g" if "nhentai" in domain else "gallery"
+        viewer_url = f"https://{domain}/{view_prefix}/{gid}/1/"
+        gal_url = f"https://{domain}/{gal_prefix}/{gid}/"
+
+        rv = requests.get(viewer_url, headers=headers, timeout=15)
+        # Case A: Modern readerApp + readerPagesJson (HentaiEnvy, HentaiRox, HentaiZap)
+        m_json = re.search(
+            r'id="readerPagesJson"[^>]*>(.*?)</script>', rv.text, re.S | re.I
+        )
+        m_base = re.search(r'data-reader-image-base="([^"]+)"', rv.text, re.I)
+        if m_json and m_base:
+            img_base = m_base.group(1).rstrip("/")
+            m_seo = re.search(r'data-reader-seo-title="([^"]+)"', rv.text, re.I)
+            clean_title = m_seo.group(1) if m_seo else f"{site_label}_{gid}"
+            pages_list = json.loads(m_json.group(1))
+            pages = [
+                (
+                    int(item["page"]),
+                    item.get("ext", "webp").lstrip("."),
+                    f"{img_base}/{item['page']}.{item.get('ext', 'webp').lstrip('.')}",
+                )
+                for item in pages_list
+            ]
+            if pages:
+                return site_label, clean_title, pages, viewer_url
+
+        # Case B: Classic g_th JSON dictionary on gallery page (ImHentai, HentaiEra, HentaiFox, nhentai.xxx)
+        rg = requests.get(gal_url, headers=headers, timeout=15)
+        m_gth = re.search(r"var\s+g_th\s*=\s*\$\.parseJSON\('([^']+)'\)", rg.text)
+        if m_gth:
+            gth_dict = json.loads(m_gth.group(1))
+            # If g_th is nested under "fl" (e.g. {"fl": {"1": "j,1280,1800", ...}}), unwrap it
+            if "fl" in gth_dict and isinstance(gth_dict["fl"], dict):
+                gth_dict = gth_dict["fl"]
+            m_h1 = re.search(r"<h1>([^<]+)</h1>", rg.text)
+            clean_title = m_h1.group(1).strip() if m_h1 else f"{site_label}_{gid}"
+            # Locate image base from cover or 1t thumbnail
+            m_base_u = re.search(
+                r'(https?://[a-z0-9.]+\.[a-z]+/\d+/[a-z0-9_]+)/(?:cover|1t)\.(?:jpg|png|webp|gif)',
+                rg.text,
+                re.I,
+            )
+            if m_base_u:
+                img_base = m_base_u.group(1)
+                pages = []
+                numeric_keys = [k for k in gth_dict.keys() if str(k).isdigit()]
+                for p_str in sorted(numeric_keys, key=int):
+                    p_num = int(p_str)
+                    ext_code = str(gth_dict[p_str]).split(",")[0]
+                    ext = ext_map.get(ext_code, "jpg")
+                    pages.append((p_num, ext, f"{img_base}/{p_num}.{ext}"))
+                if pages:
+                    return site_label, clean_title, pages, gal_url
+
+    return None
+
+
 def search_mangafire(keyword: str) -> str | None:
     """Searches MangaFire API using VRF signature and returns the best matching title URL."""
     try:
@@ -265,7 +572,7 @@ def search_mangafire(keyword: str) -> str | None:
             headers={
                 "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": "Mozilla/5.0",
+                "User-Agent": UA_STRING,
             },
             timeout=10,
         )
@@ -302,12 +609,18 @@ def search_mangadex(keyword: str) -> str | None:
 
 def resolve_manga_url(raw_input: str, status_cb=None) -> tuple[str, str]:
     """
-    Normalizes and resolves input URLs (or manga titles) across common manga sites.
+    Normalizes and resolves input URLs (or manga titles / 6-digit codes) across common
+    manga, webtoon, hentai, and doujin sites.
     Returns (resolved_url, source_note).
     """
     url = raw_input.strip()
     if not url:
-        raise ValueError("Please paste a Manga URL or title into the input box first!")
+        raise ValueError("Please paste a Manga or Doujin URL into the input box first!")
+
+    # 0. Support 5-6 digit nhentai nuclear codes directly (e.g., "177013" or "#177013")
+    if re.fullmatch(r"#?\d{5,6}", url):
+        code = url.lstrip("#")
+        return f"https://nhentai.net/g/{code}/", f"NHentai (#{code})"
 
     # 1. Normalize MangaDex URLs (strip ?tab=art, ?tab=chapters, etc.)
     md_match = re.match(
@@ -361,9 +674,7 @@ def resolve_manga_url(raw_input: str, status_cb=None) -> tuple[str, str]:
         try:
             if status_cb:
                 status_cb("Resolving comix.to manga title...")
-            resp = requests.get(
-                url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10
-            )
+            resp = requests.get(url, headers={"User-Agent": UA_STRING}, timeout=10)
             m_title = re.search(r"<title>([^<]+)</title>", resp.text)
             if m_title:
                 title_guess = m_title.group(1).strip()
@@ -388,7 +699,7 @@ def resolve_manga_url(raw_input: str, status_cb=None) -> tuple[str, str]:
         parts = [p for p in parsed.path.split("/") if p]
         if parts:
             slug = re.sub(r"^[0-9a-z]{3,6}-", "", parts[-1]).replace("-", " ")
-            if len(slug) > 2:
+            if len(slug) > 2 and not slug.isdigit():
                 if status_cb:
                     status_cb(f"Searching supported sources for '{slug}'...")
                 mf_url = search_mangafire(slug)
@@ -398,8 +709,8 @@ def resolve_manga_url(raw_input: str, status_cb=None) -> tuple[str, str]:
                 if md_url:
                     return md_url, f"MangaDex ({slug})"
         raise ValueError(
-            f"Unsupported site or manga not found for URL:\n{url}\n\n"
-            "Click 'Supported Sites ▾' to see supported sites, or paste the manga's title directly!"
+            f"Unsupported site or gallery not found for URL:\n{url}\n\n"
+            "Click 'Supported Sites ▼' to see supported sites, or paste the manga's title directly!"
         )
 
     # 5. Plain text title search!
@@ -414,50 +725,68 @@ def resolve_manga_url(raw_input: str, status_cb=None) -> tuple[str, str]:
 
     raise ValueError(
         f"Could not find any manga with English chapters matching:\n'{url}'\n\n"
-        "Please check the spelling or paste a direct link from MangaDex, MangaFire, WeebCentral, etc."
+        "Please check the spelling or paste a direct link from MangaDex, MangaFire, NHentai, HentaiVox, etc."
     )
 
 
-def get_supported_sites_list() -> list[tuple[str, str, bool]]:
+def get_supported_sites_list() -> list[tuple[str, str, str]]:
     """
-    Returns a sorted list of (DisplayName, DomainOrURL, IsFeaturedMangaSite)
-    for all supported sites.
+    Returns a categorized list of (DisplayName, DomainOrURL, CategoryGroup)
+    where CategoryGroup is 'MANGA', 'DOUJIN', or 'OTHER'.
     """
-    featured = [
-        ("MangaDex", "https://mangadex.org", True),
-        ("MangaFire", "https://mangafire.to", True),
-        ("Comix.to (Auto-Resolved)", "https://comix.to", True),
-        ("WeebCentral", "https://weebcentral.com", True),
-        ("MangaPark", "https://mangapark.net", True),
-        ("MangaSee / Manga4Life", "https://mangasee123.com", True),
-        ("MangaReader", "https://mangareader.to", True),
-        ("MangaHere", "https://www.mangahere.cc", True),
-        ("MangaFox (FanFox)", "https://fanfox.net", True),
-        ("MangaTown", "https://www.mangatown.com", True),
-        ("MangaRead", "https://www.mangaread.org", True),
-        ("MangaFreak", "https://mangafreak.me", True),
-        ("MangaTaro", "https://mangataro.org", True),
-        ("TCB Scans", "https://tcbonepiecechapters.com", True),
-        ("Dynasty Scans", "https://dynasty-scans.com", True),
-        ("Webtoons", "https://www.webtoons.com", True),
-        ("Naver Webtoon", "https://comic.naver.com", True),
-        ("Tapas", "https://tapas.io", True),
-        ("SenManga", "https://raw.senmanga.com", True),
-        ("RawKuma", "https://rawkuma.net", True),
-        ("KaliScan", "https://kaliscan.me", True),
-        ("KomikCast", "https://komikcast.li", True),
-        ("Hiperdex", "https://hiperdex.com", True),
-        ("Danke fürs Lesen", "https://danke.moe", True),
-        ("NHentai", "https://nhentai.net", True),
-        ("E-Hentai / ExHentai", "https://e-hentai.org", True),
-        ("Hitomi.la", "https://hitomi.la", True),
-        ("IMHentai", "https://imhentai.xxx", True),
-        ("Hentai2Read", "https://hentai2read.com", True),
-        ("Simply Hentai", "https://www.simply-hentai.com", True),
-        ("Pixiv (Comics & Art)", "https://www.pixiv.net", True),
-        ("Cubari / Imgur / Chest", "https://cubari.moe", True),
+    manga_featured = [
+        ("MangaDex", "https://mangadex.org", "MANGA"),
+        ("MangaFire", "https://mangafire.to", "MANGA"),
+        ("Comix.to (Auto-Resolved)", "https://comix.to", "MANGA"),
+        ("WeebCentral", "https://weebcentral.com", "MANGA"),
+        ("MangaPark", "https://mangapark.net", "MANGA"),
+        ("MangaSee / Manga4Life", "https://mangasee123.com", "MANGA"),
+        ("MangaReader", "https://mangareader.to", "MANGA"),
+        ("MangaHere", "https://www.mangahere.cc", "MANGA"),
+        ("MangaFox (FanFox)", "https://fanfox.net", "MANGA"),
+        ("MangaTown", "https://www.mangatown.com", "MANGA"),
+        ("MangaRead", "https://www.mangaread.org", "MANGA"),
+        ("MangaFreak", "https://mangafreak.me", "MANGA"),
+        ("MangaTaro", "https://mangataro.org", "MANGA"),
+        ("TCB Scans", "https://tcbonepiecechapters.com", "MANGA"),
+        ("Dynasty Scans", "https://dynasty-scans.com", "MANGA"),
+        ("Webtoons", "https://www.webtoons.com", "MANGA"),
+        ("Naver Webtoon", "https://comic.naver.com", "MANGA"),
+        ("Tapas", "https://tapas.io", "MANGA"),
+        ("SenManga", "https://raw.senmanga.com", "MANGA"),
+        ("RawKuma", "https://rawkuma.net", "MANGA"),
+        ("KaliScan", "https://kaliscan.me", "MANGA"),
+        ("KomikCast", "https://komikcast.li", "MANGA"),
+        ("Danke fürs Lesen", "https://danke.moe", "MANGA"),
+        ("Cubari / Imgur / Chest", "https://cubari.moe", "MANGA"),
     ]
-    seen_keys = {name.lower().split()[0] for name, _, _ in featured}
+
+    doujin_featured = [
+        ("NHentai (.net / .xxx / 6-digit codes)", "https://nhentai.net", "DOUJIN"),
+        ("HentaiVox", "https://hentaivox.com", "DOUJIN"),
+        ("HentaiPaw", "https://hentaipaw.com", "DOUJIN"),
+        ("RokuHentai", "https://rokuhentai.com", "DOUJIN"),
+        ("IMHentai", "https://imhentai.xxx", "DOUJIN"),
+        ("HentaiEra", "https://hentaiera.com", "DOUJIN"),
+        ("HentaiFox", "https://hentaifox.com", "DOUJIN"),
+        ("HentaiEnvy", "https://hentaienvy.com", "DOUJIN"),
+        ("HentaiRox", "https://hentairox.com", "DOUJIN"),
+        ("HentaiZap", "https://hentaizap.com", "DOUJIN"),
+        ("AsmHentai", "https://asmhentai.com", "DOUJIN"),
+        ("3Hentai", "https://3hentai.net", "DOUJIN"),
+        ("E-Hentai / ExHentai", "https://e-hentai.org", "DOUJIN"),
+        ("Hitomi.la", "https://hitomi.la", "DOUJIN"),
+        ("Hentai2Read", "https://hentai2read.com", "DOUJIN"),
+        ("HentaiHere", "https://hentaihere.com", "DOUJIN"),
+        ("Simply Hentai", "https://www.simply-hentai.com", "DOUJIN"),
+        ("Hiperdex", "https://hiperdex.com", "DOUJIN"),
+        ("AllPornComic", "https://allporncomic.com", "DOUJIN"),
+        ("Pixiv (Comics & Art)", "https://www.pixiv.net", "DOUJIN"),
+    ]
+
+    seen_keys = {
+        name.lower().split()[0] for name, _, _ in (manga_featured + doujin_featured)
+    }
 
     other_sites = {}
     for ext in extractor.extractors():
@@ -473,10 +802,10 @@ def get_supported_sites_list() -> list[tuple[str, str, bool]]:
         if cat not in other_sites or (not other_sites[cat] and root):
             other_sites[cat] = root
 
-    result = list(featured)
+    result = list(manga_featured) + list(doujin_featured)
     for cat in sorted(other_sites.keys(), key=lambda s: s.lower()):
         result.append(
-            (cat.capitalize(), other_sites[cat] or "Supported Extractor", False)
+            (cat.capitalize(), other_sites[cat] or "Supported Extractor", "OTHER")
         )
     return result
 
@@ -504,7 +833,7 @@ class MangaMaidApp:
 
     WIN_W = 1280
     WIN_H = 720
-    PLACEHOLDER = "Paste manga link here (MangaDex, MangaFire, comix.to, etc.)..."
+    PLACEHOLDER = "Paste manga/doujin link or code (MangaDex, NHentai, HentaiVox, etc.)..."
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -546,6 +875,7 @@ class MangaMaidApp:
         self.total_chapters = 0
         self.current_chapter_idx = 0
         self.pages_in_current_chapter = 0
+        self.expected_pages_in_chapter = 28
         self._sites_popup = None
         self._error_popup = None
 
@@ -564,15 +894,7 @@ class MangaMaidApp:
         self.root.destroy()
 
     def _prepare_visuals(self):
-        """
-        Composites the new 16:9 Split-Column Mockup Layout:
-        - Left Side: Large MangaMaid Logo + Version Badge
-        - Right Top: Interactive Mascot Art
-        - Top Left Corner: BGM & SFX Toggle Switch Card
-        - Right Middle: Input Card (MANGA URL, SAVE FOLDER, Paste, Supported Sites, Select Destination)
-        - Right Below Input: Title Pill ("MangaMaid Downloader & Packager") + Action CTA Pill ("Touch Me to Get Started!")
-        - Right Bottom: Status & Overall Progress Bar Card
-        """
+        """Composites the 16:9 Split-Column Layout."""
         bg_path = resource_path(os.path.join("assets", "bg_16x9.jpg"))
         if not os.path.exists(bg_path):
             bg_path = resource_path(os.path.join("assets", "bg.jpg"))
@@ -586,15 +908,10 @@ class MangaMaidApp:
         # Drop shadows for cards & pills
         shadow_layer = Image.new("RGBA", (self.WIN_W, self.WIN_H), (0, 0, 0, 0))
         sdraw = ImageDraw.Draw(shadow_layer)
-        # Top-left BGM / SFX control pill shadow
         sdraw.rounded_rectangle((28, 22, 344, 68), radius=22, fill=(90, 20, 55, 55))
-        # Bottom-left Version pill shadow
         sdraw.rounded_rectangle((134, 650, 484, 692), radius=20, fill=(90, 20, 55, 55))
-        # Right Input Card shadow (x: 644..1246, y: 428..542)
         sdraw.rounded_rectangle((648, 434, 1250, 548), radius=24, fill=(90, 20, 55, 60))
-        # Left Title Pill shadow (x: 644..932, y: 556..594)
         sdraw.rounded_rectangle((648, 561, 936, 599), radius=19, fill=(90, 20, 55, 55))
-        # Bottom Progress Card shadow (x: 644..1246, y: 608..700)
         sdraw.rounded_rectangle((648, 614, 1250, 706), radius=22, fill=(90, 20, 55, 60))
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(7))
         bg = Image.alpha_composite(bg, shadow_layer)
@@ -743,7 +1060,7 @@ class MangaMaidApp:
 
         bg = Image.alpha_composite(bg, overlay)
 
-        # 6. Composite Large Manga Maid Logo on the Left Side (center x=305, y=355)
+        # 6. Composite Large Manga Maid Logo on the Left Side
         logo_raw = Image.open(logo_path).convert("RGBA")
         logo_w = 576
         logo_h = int(logo_raw.height * (logo_w / logo_raw.width))
@@ -753,7 +1070,7 @@ class MangaMaidApp:
         self.bg_image = bg
         self.bg_photo = ImageTk.PhotoImage(bg)
 
-        # 7. Prepare Mascot Character Sprites (Right Top, above Input Card: center x=945, y=214)
+        # 7. Prepare Mascot Character Sprites
         mascot_raw = Image.open(mascot_path).convert("RGBA")
         m_h = 416
         m_w = int(mascot_raw.width * (m_h / mascot_raw.height))
@@ -769,7 +1086,7 @@ class MangaMaidApp:
             scale=1.0, brightness=1.03
         )
 
-        # 8. Prepare Action CTA Pill Sprites (Right of Subtitle Pill: x: 946..1246, y: 556..594 -> center 1096, 575)
+        # 8. Prepare Action CTA Pill Sprites
         self.cta_normal_im, self.cta_normal_tk = self._build_cta_pill_sprite(
             text="Touch Me to Get Started!", mode="normal"
         )
@@ -819,7 +1136,6 @@ class MangaMaidApp:
     def _build_mascot_char_sprite(
         self, scale: float, brightness: float
     ) -> tuple[Image.Image, ImageTk.PhotoImage]:
-        """Builds the standalone Mascot character sprite for the top-right area."""
         cw, ch = 380, 432
         canvas_im = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         m_im = self.mascot_base
@@ -840,12 +1156,10 @@ class MangaMaidApp:
     def _build_cta_pill_sprite(
         self, text: str, mode: str
     ) -> tuple[Image.Image, ImageTk.PhotoImage]:
-        """Builds the 304x44 Action Pill ('Touch Me to Get Started!' / 'Downloading Your Manga...')."""
         cw, ch = 304, 44
         im = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         draw = ImageDraw.Draw(im)
 
-        # Shadow
         draw.rounded_rectangle(
             (4, 5, cw - 2, ch - 1), radius=19, fill=(80, 10, 45, 80)
         )
@@ -853,7 +1167,7 @@ class MangaMaidApp:
         draw = ImageDraw.Draw(im)
 
         if mode == "busy":
-            fill_col = (139, 92, 246, 250)  # Vibrant purple from user's mockup!
+            fill_col = (139, 92, 246, 250)
             inner_col = (221, 214, 254, 170)
         elif mode == "hover":
             fill_col = (236, 72, 153, 255)
@@ -903,7 +1217,6 @@ class MangaMaidApp:
     def _build_toggle_sprite(
         self, label: str, is_on: bool
     ) -> tuple[Image.Image, ImageTk.PhotoImage]:
-        """Builds a sleek custom pill switch sprite for BGM and SFX toggles."""
         cw, ch = 108, 32
         im = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         draw = ImageDraw.Draw(im)
@@ -920,7 +1233,6 @@ class MangaMaidApp:
             width=2,
         )
 
-        # Knob circle
         knob_r = 11
         knob_x = cw - 16 if is_on else 16
         knob_y = ch // 2
@@ -929,7 +1241,6 @@ class MangaMaidApp:
             fill=(255, 255, 255, 255),
         )
 
-        # Text
         state_txt = f"{label}: ON" if is_on else f"{label}: OFF"
         text_x = (cw - 24) // 2 + 4 if is_on else (cw + 20) // 2 - 2
         font_t = load_font(11, bold=True)
@@ -1250,19 +1561,21 @@ class MangaMaidApp:
         popup.focus_force()
 
     def show_supported_sites_popup(self):
-        """Opens a scrollable, searchable popup window listing all supported manga & gallery sites."""
+        """Opens a scrollable, searchable popup window listing all supported manga, doujin, & hentai sites."""
         if self._sites_popup is not None and self._sites_popup.winfo_exists():
             self._sites_popup.lift()
             self._sites_popup.focus_force()
             return
 
         popup = tk.Toplevel(self.root)
-        popup.title(f"MangaMaid ({APP_VERSION}) — Supported Manga & Comic Sites")
+        popup.title(
+            f"MangaMaid ({APP_VERSION}) — Supported Manga, Doujin & Hentai Sites"
+        )
         popup.configure(bg="#FFF5F9")
         popup.resizable(False, False)
         self._sites_popup = popup
 
-        pw, ph = 560, 520
+        pw, ph = 580, 540
         rx = self.root.winfo_rootx() + (self.WIN_W - pw) // 2
         ry = self.root.winfo_rooty() + (self.WIN_H - ph) // 2
         popup.geometry(f"{pw}x{ph}+{rx}+{ry}")
@@ -1278,7 +1591,7 @@ class MangaMaidApp:
         hdr.pack(fill="x")
         tk.Label(
             hdr,
-            text="Supported Manga & Comic Sites",
+            text="Supported Manga, Doujin & Hentai Sites",
             font=("Segoe UI", 13, "bold"),
             bg="#DB2777",
             fg="#FFFFFF",
@@ -1332,17 +1645,24 @@ class MangaMaidApp:
         def _populate(filter_str: str = ""):
             listbox.delete(0, tk.END)
             q = filter_str.strip().lower()
-            featured_added = False
+            manga_added = False
+            doujin_added = False
             others_added = False
-            for name, domain, is_featured in all_sites:
+            for name, domain, group in all_sites:
                 if q and (q not in name.lower() and q not in domain.lower()):
                     continue
-                if is_featured and not featured_added:
+                if group == "MANGA" and not manga_added:
                     listbox.insert(tk.END, "  ★ POPULAR MANGA & WEBTOON SITES ★")
                     listbox.itemconfig(listbox.size() - 1, bg="#FCE7F3", fg="#9D174D")
-                    featured_added = True
-                elif not is_featured and not others_added:
-                    if featured_added:
+                    manga_added = True
+                elif group == "DOUJIN" and not doujin_added:
+                    if manga_added:
+                        listbox.insert(tk.END, "")
+                    listbox.insert(tk.END, "  ★ POPULAR DOUJIN & HENTAI SITES ★")
+                    listbox.itemconfig(listbox.size() - 1, bg="#FCE7F3", fg="#9D174D")
+                    doujin_added = True
+                elif group == "OTHER" and not others_added:
+                    if manga_added or doujin_added:
                         listbox.insert(tk.END, "")
                     listbox.insert(
                         tk.END,
@@ -1361,7 +1681,7 @@ class MangaMaidApp:
         ftr.pack(fill="x")
         tk.Label(
             ftr,
-            text="Tip: You can also paste plain manga titles and MangaMaid will search automatically!",
+            text="Tip: Paste any URL, manga title, or 6-digit NHentai code!",
             font=("Segoe UI", 9, "italic"),
             bg="#FFF5F9",
             fg="#831843",
@@ -1489,7 +1809,9 @@ class MangaMaidApp:
         if not raw_url or raw_url == self.PLACEHOLDER:
             try:
                 clip = self.root.clipboard_get().strip()
-                if clip.startswith(("http://", "https://")):
+                if clip.startswith(("http://", "https://")) or re.fullmatch(
+                    r"#?\d{5,6}", clip
+                ):
                     self._paste_from_clipboard()
                     raw_url = clip
             except Exception:
@@ -1499,8 +1821,8 @@ class MangaMaidApp:
             self.set_status("Paste a Manga URL above first!")
             self.url_entry.focus_set()
             self.show_error_popup(
-                "Missing Manga URL",
-                "Please paste a manga link (or manga title) into the 'MANGA URL' box before touching the Manga Maid!",
+                "Missing Manga / Doujin URL",
+                "Please paste a manga/doujin link, title, or 6-digit code into the 'MANGA URL' box before touching the Manga Maid!",
             )
             return
 
@@ -1511,13 +1833,14 @@ class MangaMaidApp:
         self.total_chapters = 0
         self.current_chapter_idx = 0
         self.pages_in_current_chapter = 0
+        self.expected_pages_in_chapter = 28
         self._max_progress = 0.02
         self.log_capture.clear()
 
         self.canvas.itemconfig(self.mascot_item, image=self.mascot_busy_tk)
         self.canvas.itemconfig(self.cta_item, image=self.cta_busy_tk)
         self.set_progress(0.02, "2% (Starting...)")
-        self.set_status("Connecting to manga source...")
+        self.set_status("Connecting to source...")
 
         threading.Thread(
             target=self._download_worker,
@@ -1527,14 +1850,15 @@ class MangaMaidApp:
 
     def _update_overall_progress(self):
         """Computes smooth, strictly non-decreasing overall job progress from 0% to 100%."""
+        denom = max(10.0, float(self.expected_pages_in_chapter))
         if self.total_chapters > 0:
             completed_ch = max(0, self.current_chapter_idx - 1, self.cbz_created)
-            ch_partial = min(0.90, self.pages_in_current_chapter / 28.0)
+            ch_partial = min(0.94, self.pages_in_current_chapter / denom)
             raw_frac = 0.05 + 0.93 * (
                 (completed_ch + ch_partial) / float(self.total_chapters)
             )
         else:
-            raw_frac = min(0.90, 0.05 + self.pages_downloaded * 0.01)
+            raw_frac = min(0.92, 0.05 + (self.pages_downloaded / denom) * 0.90)
 
         self._max_progress = max(
             getattr(self, "_max_progress", 0.0), min(0.99, raw_frac)
@@ -1553,27 +1877,141 @@ class MangaMaidApp:
 
     def _on_total_chapters(self, total: int):
         self.total_chapters = max(1, total)
-        self.set_status(f"Found {self.total_chapters} English chapters!")
+        self.set_status(f"Found {self.total_chapters} chapters/galleries!")
         self._update_overall_progress()
+
+    def _on_expected_pages(self, page_count: int):
+        if page_count > 0:
+            self.expected_pages_in_chapter = page_count
 
     def _on_chapter_start(self, idx: int, total: int, kwdict: dict):
         self.current_chapter_idx = idx
         self.total_chapters = max(1, total)
         self.pages_in_current_chapter = 0
+        self.expected_pages_in_chapter = int(kwdict.get("count") or 28)
         ch_num = kwdict.get("chapter", idx)
         self.set_status(f"Downloading [{idx}/{total}]: Ch.{ch_num}")
         self._update_overall_progress()
 
+    def _run_custom_gallery_download(
+        self,
+        source_name: str,
+        clean_title: str,
+        pages: list[tuple[int, str, str]],
+        referer_url: str,
+        dest_dir: str,
+    ):
+        """Downloads all pages from our custom Doujin/Hentai extractor in parallel and packs into .cbz."""
+        total_pages = len(pages)
+        self.total_chapters = 1
+        self.current_chapter_idx = 1
+        self.expected_pages_in_chapter = max(1, total_pages)
+
+        folder_name = sanitize_filename(clean_title)
+        gallery_dir = os.path.join(dest_dir, folder_name)
+        os.makedirs(gallery_dir, exist_ok=True)
+        self.last_manga_dir = gallery_dir
+        cbz_path = os.path.join(gallery_dir, f"{folder_name}.cbz")
+
+        self.set_status(f"{source_name}: {total_pages} pages found!")
+        self._update_overall_progress()
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": UA_STRING, "Referer": referer_url})
+
+        def _fetch_one(item: tuple[int, str, str]):
+            p_num, ext, img_url = item
+            local_name = f"{p_num:03d}.{ext}"
+            local_path = os.path.join(gallery_dir, local_name)
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 500:
+                return p_num, local_name, local_path, True
+
+            for attempt in range(4):
+                try:
+                    resp = session.get(img_url, timeout=25)
+                    if resp.status_code == 200 and len(resp.content) > 400:
+                        with open(local_path, "wb") as f:
+                            f.write(resp.content)
+                        return p_num, local_name, local_path, False
+                except Exception:
+                    time.sleep(0.8 * (attempt + 1))
+            raise RuntimeError(f"Failed to download page {p_num} from {source_name}")
+
+        downloaded_files = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one, item): item for item in pages}
+            for fut in concurrent.futures.as_completed(futures):
+                p_num, local_name, local_path, skipped = fut.result()
+                downloaded_files.append((p_num, local_name, local_path))
+                self.pages_downloaded += 1
+                self.pages_in_current_chapter += 1
+                self._update_overall_progress()
+                action = "Skipped" if skipped else "Downloading"
+                self.set_status(
+                    f"{action} [1/1]: Page {self.pages_downloaded}/{total_pages}"
+                )
+
+        downloaded_files.sort(key=lambda x: x[0])
+        self.set_status("Packing pages into CBZ archive...")
+
+        with zipfile.ZipFile(cbz_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for _, local_name, local_path in downloaded_files:
+                zf.write(local_path, arcname=local_name)
+
+        for _, _, local_path in downloaded_files:
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        self._on_cbz_finalized(cbz_path)
+
     def _download_worker(self, raw_url: str, dest_dir: str):
         try:
+            # 1. First check if our Universal Doujin/Gallery Engine handles this URL directly
+            custom_match = extract_custom_gallery_pages(
+                raw_url.strip(), status_cb=self.set_status
+            )
+            if custom_match is not None:
+                source_name, clean_title, pages, referer_url = custom_match
+                self._run_custom_gallery_download(
+                    source_name, clean_title, pages, referer_url, dest_dir
+                )
+                self.set_progress(
+                    1.0,
+                    f"100% (1/1 CBZ | {self.pages_downloaded} pgs)",
+                )
+                self.set_status("Complete! Packed 1 CBZ archive")
+                self.sound.play_complete()
+                return
+
+            # 2. Otherwise resolve via standard Manga / Gallery-dl pipeline
             resolved_url, source_note = resolve_manga_url(
                 raw_url, status_cb=self.set_status
             )
+
+            # Check again in case resolve_manga_url turned a 6-digit code or redirect into a custom gallery URL
+            custom_match = extract_custom_gallery_pages(
+                resolved_url, status_cb=self.set_status
+            )
+            if custom_match is not None:
+                source_name, clean_title, pages, referer_url = custom_match
+                self._run_custom_gallery_download(
+                    source_name, clean_title, pages, referer_url, dest_dir
+                )
+                self.set_progress(
+                    1.0,
+                    f"100% (1/1 CBZ | {self.pages_downloaded} pgs)",
+                )
+                self.set_status("Complete! Packed 1 CBZ archive")
+                self.sound.play_complete()
+                return
+
             self.set_status(f"Scanning {source_note} chapters...")
             self._max_progress = 0.05
             self.set_progress(0.05, "5% (Scanning...)")
 
-            # Configure gallery-dl for clean English CBZ packaging
+            # Configure gallery-dl for both multi-chapter manga AND single-gallery doujin sites
             config.clear()
             config.set((), "base-directory", dest_dir)
             config.set(
@@ -1581,17 +2019,23 @@ class MangaMaidApp:
                 "directory",
                 [
                     "{manga}",
-                    "{volume:?v/ />02}c{chapter:>03}{chapter_minor:?//}{title:? - //}",
+                    "{volume:?v/ />02}{chapter:?c//>03}{chapter_minor:?//}{title:? - //}",
                 ],
             )
             config.set(
                 ("extractor",),
                 "filename",
-                "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}",
+                "{manga}_{chapter:?c//>03}{chapter_minor:?//}_{page:>03}.{extension}",
             )
             config.set((), "lang", "en")
             config.set((), "chapter-reverse", False)
-            config.set((), "child-filter", "lang in ('en', 'eng', None, '')")
+            # Only apply English child-filter on multi-language manga sites like MangaDex/MangaFire
+            if any(
+                k in resolved_url.lower()
+                for k in ("mangadex.org", "mangafire.to", "weebcentral.com", "mangapark")
+            ):
+                config.set((), "child-filter", "lang in ('en', 'eng', None, '')")
+
             config.setg(
                 "postprocessors",
                 [
@@ -1621,6 +2065,7 @@ class MangaMaidApp:
                     resolved_url,
                     on_total_chapters=self._on_total_chapters,
                     on_chapter_start=self._on_chapter_start,
+                    on_expected_pages=self._on_expected_pages,
                 )
                 status = dl_job.run()
             finally:
@@ -1644,18 +2089,18 @@ class MangaMaidApp:
                     lambda: self.show_error_popup(
                         "Download Failed",
                         f"MangaMaid encountered an error while trying to download from {source_note}. "
-                        "No English chapters could be retrieved.",
+                        "No chapters or pages could be retrieved.",
                         details=err_details or f"Source URL: {resolved_url}",
                     ),
                 )
             elif self.total_chapters == 0:
                 self.set_progress(0.0, "0 CBZ found")
-                self.set_status("No English chapters found!")
+                self.set_status("No chapters found!")
                 self.root.after(
                     0,
                     lambda: self.show_error_popup(
-                        "No English Chapters Found",
-                        f"We connected to {source_note}, but no English chapters were found for this link.",
+                        "No Chapters Found",
+                        f"We connected to {source_note}, but no downloadable chapters or pages were found for this link.",
                         details=f"Resolved URL: {resolved_url}",
                     ),
                 )
@@ -1672,7 +2117,7 @@ class MangaMaidApp:
             self.root.after(
                 0,
                 lambda: self.show_error_popup(
-                    "Unable to Download Manga",
+                    "Unable to Download Manga / Doujin",
                     err_msg,
                     details=err_log,
                 ),
@@ -1697,14 +2142,13 @@ class MangaMaidApp:
         if os.path.isdir(manga_dir):
             self.last_manga_dir = manga_dir
         ch_name = os.path.basename(parent_dir)
-        # Extract short volume/chapter code like "v03 c014"
         short_ch = ch_name.split(" - ")[0].strip()
 
         self._update_overall_progress()
         action = "Skipped" if skipped else "Downloading"
         if self.total_chapters > 0:
             self.set_status(
-                f"{action} [{self.current_chapter_idx}/{self.total_chapters}]: {short_ch} (p.{self.pages_in_current_chapter})"
+                f"{action} [{max(1, self.current_chapter_idx)}/{self.total_chapters}]: {short_ch} (p.{self.pages_in_current_chapter})"
             )
         else:
             self.set_status(
@@ -1749,7 +2193,7 @@ class MangaMaidApp:
         font_entry = load_font(13, bold=False)
         draw.text(
             (800, 461),
-            "Paste manga link here...",
+            "Paste manga or doujin link here...",
             font=font_entry,
             fill=(140, 140, 140, 255),
             anchor="lm",
@@ -1784,7 +2228,7 @@ class MangaMaidApp:
             anchor="mm",
         )
 
-        # Destination path text
+        # Destination path text (generic path when generating public screenshot)
         preview_dest = self.dest_dir
         if "--screenshot" in sys.argv:
             preview_dest = r"C:\Users\User\Downloads"
@@ -1811,7 +2255,7 @@ class MangaMaidApp:
             anchor="mm",
         )
 
-        # 5. Bottom Status & Progress bar preview (showing active state like the mockup)
+        # 5. Bottom Status & Progress bar preview
         draw.text(
             (668, 634),
             "Ready! Touch the Manga Maid to start~",
