@@ -13,15 +13,20 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import urllib.parse
-import winsound
 import zipfile
 import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageTk
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 import requests
 import gallery_dl
@@ -69,8 +74,9 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
 
 class SoundManager:
     """
-    Manages both looping Chiptune BGM (via winsound) and MP3 SFX (via winmm MCI)
-    on separate channels with independent BGM and SFX toggle switches.
+    Cross-platform SoundManager for Windows and macOS:
+    - Windows: Looping Chiptune BGM via `winsound` + MP3 SFX via `winmm` MCI.
+    - macOS: Looping Chiptune BGM & MP3 SFX via native `afplay` (`-v 0.6`).
     """
 
     def __init__(self, bgm_wav: str, click_mp3: str, complete_mp3: str):
@@ -80,23 +86,50 @@ class SoundManager:
         self.bgm_enabled = True
         self.sfx_enabled = True
         self._lock = threading.Lock()
+        self._bgm_stop_evt = threading.Event()
+        self._bgm_proc = None
 
     def start_bgm(self):
         if not self.bgm_enabled or not os.path.exists(self.bgm_wav):
             return
-        try:
-            winsound.PlaySound(
-                self.bgm_wav,
-                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
-            )
-        except Exception:
-            pass
+        if sys.platform == "win32" and winsound is not None:
+            try:
+                winsound.PlaySound(
+                    self.bgm_wav,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
+                )
+            except Exception:
+                pass
+        elif sys.platform == "darwin":
+            self._bgm_stop_evt.clear()
+            threading.Thread(target=self._mac_bgm_loop, daemon=True).start()
+
+    def _mac_bgm_loop(self):
+        while not self._bgm_stop_evt.is_set() and self.bgm_enabled:
+            try:
+                self._bgm_proc = subprocess.Popen(
+                    ["afplay", "-v", "0.85", self.bgm_wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._bgm_proc.wait()
+            except Exception:
+                break
 
     def stop_bgm(self):
-        try:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-        except Exception:
-            pass
+        if sys.platform == "win32" and winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        elif sys.platform == "darwin":
+            self._bgm_stop_evt.set()
+            if self._bgm_proc is not None:
+                try:
+                    self._bgm_proc.terminate()
+                except Exception:
+                    pass
+                self._bgm_proc = None
 
     def set_bgm_enabled(self, enabled: bool):
         self.bgm_enabled = enabled
@@ -124,6 +157,18 @@ class SoundManager:
         ).start()
 
     def _play_mp3_worker(self, mp3_path: str, alias: str):
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(
+                    ["afplay", "-v", "0.6", mp3_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except Exception:
+                pass
+            return
+
         with self._lock:
             try:
                 winmm = ctypes.windll.winmm
@@ -811,7 +856,28 @@ def get_supported_sites_list() -> list[tuple[str, str, str]]:
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Loads a clean Windows UI font (Segoe UI / Arial) with fallback."""
+    """Loads a clean UI font on both Windows and macOS with fallback."""
+    if sys.platform == "darwin":
+        mac_paths = (
+            [
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/System/Library/Fonts/HelveticaNeue.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+            ]
+            if bold
+            else [
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/HelveticaNeue.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+            ]
+        )
+        for p in mac_paths:
+            if os.path.exists(p):
+                try:
+                    return ImageFont.truetype(p, size)
+                except Exception:
+                    pass
+
     candidates = (
         ["segoeuib.ttf", "arialbd.ttf", "calibrib.ttf"]
         if bold
@@ -847,11 +913,21 @@ class MangaMaidApp:
         y_pos = max(0, (scr_h - self.WIN_H) // 2 - 20)
         self.root.geometry(f"{self.WIN_W}x{self.WIN_H}+{x_pos}+{y_pos}")
 
-        # Set window icon
+        # Set window icon (Windows .ico + cross-platform macOS iconphoto fallback)
         icon_path = resource_path(os.path.join("assets", "icon.ico"))
-        if os.path.exists(icon_path):
+        mascot_icon_path = resource_path(os.path.join("assets", "mascot.png"))
+        if sys.platform == "win32" and os.path.exists(icon_path):
             try:
                 self.root.iconbitmap(icon_path)
+            except Exception:
+                pass
+        elif os.path.exists(mascot_icon_path):
+            try:
+                icon_im = Image.open(mascot_icon_path).convert("RGBA").resize(
+                    (256, 256), Image.Resampling.LANCZOS
+                )
+                self._app_icon_photo = ImageTk.PhotoImage(icon_im)
+                self.root.iconphoto(True, self._app_icon_photo)
             except Exception:
                 pass
 
@@ -1716,6 +1792,12 @@ class MangaMaidApp:
         self.url_entry.bind(
             "<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root)
         )
+        self.url_entry.bind(
+            "<Button-2>", lambda e: menu.tk_popup(e.x_root, e.y_root)
+        )
+        self.url_entry.bind(
+            "<Command-v>", lambda e: (self._paste_from_clipboard(), "break")[1]
+        )
 
     def _on_url_focus_in(self, _event=None):
         if self.url_var.get() == self.PLACEHOLDER:
@@ -1762,7 +1844,12 @@ class MangaMaidApp:
             else self.dest_dir
         )
         if os.path.exists(target):
-            os.startfile(target)
+            if hasattr(os, "startfile"):
+                os.startfile(target)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
 
     def _on_mascot_enter(self, _event=None):
         self.canvas.config(cursor="hand2")
