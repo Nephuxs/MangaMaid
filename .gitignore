@@ -1,0 +1,16 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Temporary preview images
+*_preview.jpg
+*_preview.png
+exe_verified.jpg
