@@ -1,4 +1,4 @@
-# MangaMaid (Portable) — All-in-One Manga & Doujin Downloader & CBZ Packager
+# MangaMaid (Portable) — All-in-One Manga / Doujin Downloader & CBZ Packager
 
 ![MangaMaid (Portable) Screenshot](assets/preview.jpg)
 
