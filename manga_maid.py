@@ -1785,9 +1785,12 @@ class MangaMaidApp:
         )
 
         # Destination path text
+        preview_dest = self.dest_dir
+        if "--screenshot" in sys.argv:
+            preview_dest = r"C:\Users\User\Downloads"
         draw.text(
             (800, 509),
-            self._truncate_path(self.dest_dir, 34),
+            self._truncate_path(preview_dest, 34),
             font=font_entry,
             fill=(131, 24, 67, 255),
             anchor="lm",
